@@ -1,3 +1,7 @@
+#include <Wire.h>
+#include <RTClib.h>
+#include <EEPROM.h>
+
 #include "GyverEncoder.h"
 #include "GyverTM1637.h"
 
@@ -14,17 +18,22 @@
 #define BUZZ_PIN 7
 
 // ===== НАСТРОЙКИ =====
-#define BUZZER_ENABLED 1   // 🔊 0 = звук ВЫКЛ, 1 = звук ВКЛ
+#define BUZZER_ENABLED 1 // 🔊 0 = звук ВЫКЛ, 1 = звук ВКЛ
+#define DAWN_DURATION 20 // минут рассвета ( сколько минут реального времени ДО времени будильника лента будер разгораться)
 
-#define DAWN_DURATION 20   // минут рассвета
-#define TIME_SPEED 60000   // 1 минута = 60 секунд
+// ===== RTC =====
+RTC_DS3231 rtc;
 
 // ===== ВРЕМЯ =====
-int hrs = 12;
-int mins = 0;
+int hrs;
+int mins;
 
-int alm_hrs = 8;
-int alm_mins = 0;
+int alm_hrs;
+int alm_mins;
+
+// ===== EEPROM =====
+#define EEPROM_ALM_H 0
+#define EEPROM_ALM_M 1
 
 // ===== ОБЪЕКТЫ =====
 GyverTM1637 disp(CLK, DIO);
@@ -34,17 +43,16 @@ Encoder enc(ENC_CLK, ENC_DT, ENC_SW);
 bool isAlarmMode = false;
 bool alarmTriggered = false;
 
-unsigned long timer = 0;
+unsigned long lastMinute = 0;
 
-// рассвет
-unsigned long dawnTimer = 0;
 int brightness = 0;
-
-// энкодер
-int lastDir = 0;
 
 // ===== SETUP =====
 void setup() {
+
+  Wire.begin();
+  rtc.begin();
+
   pinMode(MOSFET_PIN, OUTPUT);
   analogWrite(MOSFET_PIN, 0);
 
@@ -60,10 +68,25 @@ void setup() {
 
   enc.setType(TYPE2);
   enc.setTickMode(MANUAL);
+
+  // ===== ЧТЕНИЕ ТЕКУЩЕГО ВРЕМЕНИ =====
+  DateTime now = rtc.now();
+  hrs = now.hour();
+  mins = now.minute();
+
+  // ===== ЧТЕНИЕ БУДИЛЬНИКА =====
+  alm_hrs = EEPROM.read(EEPROM_ALM_H);
+  alm_mins = EEPROM.read(EEPROM_ALM_M);
+
+  if (alm_hrs > 23) alm_hrs = 8;
+  if (alm_mins > 59) alm_mins = 0;
+
+  disp.displayClock(hrs, mins);
 }
 
 // ===== LOOP =====
 void loop() {
+
   enc.tick();
 
   isAlarmMode = !digitalRead(MODE_SWITCH);
@@ -72,52 +95,63 @@ void loop() {
   updateTime();
   checkAlarm();
 
-  delay(10);
+  delay(5);
 }
 
 // ===== ЭНКОДЕР =====
 void handleEncoder() {
+
   int dir = 0;
 
   if (enc.isRight()) dir = 1;
   if (enc.isLeft()) dir = -1;
 
-  // анти-дребезг: сброс направления если нет вращения
-  if (dir == 0) {
-    lastDir = 0;
-  }
-  
   if (isAlarmMode) {
+
     alm_mins += dir;
 
     if (enc.isRightH()) alm_hrs++;
     if (enc.isLeftH()) alm_hrs--;
 
     normalizeTime(alm_hrs, alm_mins);
+
+    EEPROM.update(EEPROM_ALM_H, alm_hrs);
+    EEPROM.update(EEPROM_ALM_M, alm_mins);
+
     disp.displayClock(alm_hrs, alm_mins);
 
-  } else {
+  }
+  else {
+
     mins += dir;
 
     if (enc.isRightH()) hrs++;
     if (enc.isLeftH()) hrs--;
 
     normalizeTime(hrs, mins);
+
+    // запись времени в RTC
+    rtc.adjust(DateTime(2024,1,1,hrs,mins,0));
+
     disp.displayClock(hrs, mins);
   }
 }
 
 // ===== ВРЕМЯ =====
 void updateTime() {
-  if (millis() - timer >= TIME_SPEED) {
-    timer = millis();
-    mins++;
-    normalizeTime(hrs, mins);
-  }
+
+  DateTime now = rtc.now();
+
+  hrs = now.hour();
+  mins = now.minute();
+
+  if (!isAlarmMode)
+    disp.displayClock(hrs, mins);
 }
 
 // ===== БУДИЛЬНИК =====
 void checkAlarm() {
+
   int now = hrs * 60 + mins;
   int alarmTime = alm_hrs * 60 + alm_mins;
 
@@ -125,82 +159,80 @@ void checkAlarm() {
   if (dawnStart < 0) dawnStart += 1440;
 
   bool inDawn;
-  if (dawnStart < alarmTime) {
+
+  if (dawnStart < alarmTime)
     inDawn = (now >= dawnStart && now < alarmTime);
-  } else {
+  else
     inDawn = (now >= dawnStart || now < alarmTime);
-  }
 
-// 🌅 РАССВЕТ
-if (inDawn) {
-  int dawnProgress;
+  // 🌅 РАССВЕТ
+  if (inDawn) {
 
-  if (dawnStart < alarmTime) {
-    dawnProgress = now - dawnStart;
-  } else {
-    if (now >= dawnStart)
+    int dawnProgress;
+
+    if (dawnStart < alarmTime)
       dawnProgress = now - dawnStart;
-    else
-      dawnProgress = (1440 - dawnStart) + now;
-  }
+    else {
+      if (now >= dawnStart)
+        dawnProgress = now - dawnStart;
+      else
+        dawnProgress = (1440 - dawnStart) + now;
+    }
 
-  // переводим минуты в миллисекунды внутри минуты
-  float minuteFraction = (millis() % TIME_SPEED) / (float)TIME_SPEED;
+    float k = (float)dawnProgress / DAWN_DURATION;
+    if (k > 1) k = 1;
 
-  float totalProgress = dawnProgress + minuteFraction;
+    brightness = k * 255;
 
-  float k = totalProgress / DAWN_DURATION;
-  if (k > 1.0) k = 1.0;
-
-  brightness = (int)(k * 255);
-
-  analogWrite(MOSFET_PIN, brightness);
-}
-
-  // ⏰ БУДИЛЬНИК (ОДИН РАЗ)
-  if (now == alarmTime && !alarmTriggered) {
-    if (brightness < 255) {
-    brightness += 2; // плавное добивание до максимума
-    if (brightness > 255) brightness = 255;
     analogWrite(MOSFET_PIN, brightness);
   }
-    // 🔊 ЗВУК (если включен)
-    if (BUZZER_ENABLED) {
+
+  // ⏰ БУДИЛЬНИК
+  if (now == alarmTime && !alarmTriggered) {
+
+    analogWrite(MOSFET_PIN, 255);
+
+    if (BUZZER_ENABLED)
       tone(BUZZ_PIN, 1000);
-    }
 
     alarmTriggered = true;
   }
 
-  // сброс через минуту
+  // сброс
   if (now != alarmTime && alarmTriggered) {
+
     if (now == (alarmTime + 1) % 1440) {
+
       alarmTriggered = false;
 
-      if (BUZZER_ENABLED) {
+      if (BUZZER_ENABLED)
         noTone(BUZZ_PIN);
-      }
     }
   }
 
-  // 😴 остальное время
+  // ночь
   if (!inDawn && now != alarmTime) {
+
     if (brightness > 0) {
+
       brightness--;
       analogWrite(MOSFET_PIN, brightness);
       delay(5);
-    } else {
-      analogWrite(MOSFET_PIN, 0);
+
     }
+    else
+      analogWrite(MOSFET_PIN, 0);
   }
 }
 
 // ===== НОРМАЛИЗАЦИЯ =====
 void normalizeTime(int &h, int &m) {
+
   while (m > 59) {
     m -= 60;
     h++;
   }
+
   while (m < 0) {
     m += 60;
     h--;
